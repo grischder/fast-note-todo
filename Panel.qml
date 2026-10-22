@@ -61,6 +61,20 @@ Panel {
   // follows bounded no matter what's actually stored.
   readonly property int secretReadCapBytes: 1048576
 
+  // The largest payload that still fits into what secret-tool can store.
+  // A payload without a line break is stored as it is, so it is limited by
+  // what secret-tool reads from stdin; 8191 bytes is the last size that
+  // does not draw its "password is too long" warning.
+  readonly property int maxRawBytes: 8191
+
+  // The largest payload that can be base64-encoded: the stored value is
+  // the 12 byte "omanote-b64:" marker plus the base64 of the payload,
+  // which expands it by a third, so 6132 bytes of text keeps the whole
+  // value at 8188 bytes. 6135 bytes would fit exactly into 8192, but that
+  // is where secret-tool starts warning, and the warning would show up as
+  // a save error on a save that actually worked.
+  readonly property int maxPayloadBytes: 6132
+
   readonly property bool dirty: noteText !== savedText
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
   readonly property color foreground: Color.popups.text
@@ -116,26 +130,82 @@ Panel {
   // purpose, independent of moduleName/ipcTarget above — changing it would
   // orphan whatever note is already stored under that key.
   function loadScript(field) {
+    // A payload with a line break in it is stored base64-encoded and
+    // tagged with a marker, so it is a single line in the keyring file
+    // (see storeScript). The value is read into a file first so it can be
+    // decoded byte-exactly, trailing newlines included.
+    //
     // head -c bounds how much of secret-tool's stdout we ever buffer/parse;
     // PIPESTATUS keeps the script's own exit code equal to secret-tool's
     // (not head's), so a real lookup failure still reports as an error
     // instead of looking like a successful empty read.
     return "command -v secret-tool >/dev/null 2>&1 || { echo 'secret-tool not found' >&2; exit 127; }\n"
+      + "umask 077\n"
+      + "tmp=$(mktemp -p \"${XDG_RUNTIME_DIR:-/tmp}\" omanote-load.XXXXXX) || exit 1\n"
       + "secret-tool lookup omarchy-plugin b.omanote field " + field
-      + " | head -c " + root.secretReadCapBytes + "\n"
-      + "exit \"${PIPESTATUS[0]}\""
+      + " | head -c " + root.secretReadCapBytes + " > \"$tmp\"\n"
+      + "status=${PIPESTATUS[0]}\n"
+      + "if head -c 12 -- \"$tmp\" | cmp -s - <(printf %s omanote-b64:); then\n"
+      + "  if ! tail -c +13 -- \"$tmp\" | base64 -d > \"$tmp.out\" 2>/dev/null; then\n"
+      + "    echo 'could not decode the stored note' >&2\n"
+      + "    rm -f -- \"$tmp\" \"$tmp.out\"\n"
+      + "    exit 1\n"
+      + "  fi\n"
+      + "  cat -- \"$tmp.out\"\n"
+      + "else\n"
+      + "  cat -- \"$tmp\"\n"
+      + "fi\n"
+      + "rm -f -- \"$tmp\" \"$tmp.out\"\n"
+      + "exit \"$status\""
   }
 
   function storeScript(field) {
     var label = field === "todos" ? "Fast Note Todo todos" : "Fast Note Todo note"
+    var what = field === "todos" ? "the to-do list" : "the note"
+    // gnome-keyring writes plaintext secrets raw into the keyring file, so
+    // a payload with a line break in it breaks the file's format: the
+    // daemon then rejects the whole keyring ("keyring was in an invalid or
+    // unrecognized format"), everything stored in it reads back empty, and
+    // the Secret Service asks the user to choose a password for a new
+    // keyring.
+    //
+    // A payload without a line break cannot break the file, so it is
+    // stored as it is and keeps the full size it had before. Anything with
+    // a line break is base64-encoded and tagged with a marker, which keeps
+    // it on a single line. The marker also tells an encoded value apart
+    // from one written by an earlier version, which is read back unchanged.
+    //
+    // secret-tool reads at most 8192 bytes from stdin and truncates
+    // anything beyond that *without failing*, so the size is checked up
+    // front: an oversized payload is refused instead of silently losing
+    // its tail. See maxRawBytes and maxPayloadBytes for the arithmetic.
     return "path=$1\n"
       + "if ! command -v secret-tool >/dev/null 2>&1; then\n"
       + "  echo 'secret-tool not found' >&2\n"
       + "  rm -f -- \"$path\"\n"
       + "  exit 127\n"
       + "fi\n"
-      + "secret-tool store --label='" + label + "' omarchy-plugin b.omanote field " + field + " < \"$path\"\n"
-      + "status=$?\n"
+      + "size=$(wc -c < \"$path\" | tr -d ' ')\n"
+      + "lines=$(wc -l < \"$path\" | tr -d ' ')\n"
+      + "if [ \"$lines\" -eq 0 ] && ! head -c 12 -- \"$path\" | cmp -s - <(printf %s omanote-b64:) && ! grep -q \"$(printf '\\r')\" \"$path\"; then\n"
+      + "  if [ \"$size\" -gt " + root.maxRawBytes + " ]; then\n"
+      + "    echo '" + what + " is too large for the keyring (max " + root.maxRawBytes + " bytes of text)' >&2\n"
+      + "    rm -f -- \"$path\"\n"
+      + "    exit 1\n"
+      + "  fi\n"
+      + "  secret-tool store --label='" + label + "' omarchy-plugin b.omanote field " + field + " < \"$path\"\n"
+      + "  status=$?\n"
+      + "  rm -f -- \"$path\"\n"
+      + "  exit \"$status\"\n"
+      + "fi\n"
+      + "if [ \"$size\" -gt " + root.maxPayloadBytes + " ]; then\n"
+      + "  echo '" + what + " is too large for the keyring (max " + root.maxPayloadBytes + " bytes of text)' >&2\n"
+      + "  rm -f -- \"$path\"\n"
+      + "  exit 1\n"
+      + "fi\n"
+      + "encoded=$(base64 -w0 -- \"$path\") || { echo 'could not encode " + what + "' >&2; rm -f -- \"$path\"; exit 1; }\n"
+      + "printf '%s' \"omanote-b64:$encoded\" | secret-tool store --label='" + label + "' omarchy-plugin b.omanote field " + field + "\n"
+      + "status=${PIPESTATUS[1]}\n"
       + "rm -f -- \"$path\"\n"
       + "exit \"$status\""
   }
