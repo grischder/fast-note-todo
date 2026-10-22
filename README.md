@@ -47,7 +47,38 @@ truncated value and still reports success, so the size is checked up front.
 A payload of more than 8191 bytes is refused with an error in the panel
 instead of being quietly cut short. A payload that has to be encoded — one
 with a line break in it — is limited to 6132 bytes of text, because the
-encoding takes room as well.
+encoding takes room as well. The to-do list is trimmed rather than refused:
+its oldest completed entries are dropped first, because they are a history
+buffer that is pruned anyway.
+
+If the note or the to-do list cannot be read back, the panel says so and
+writes nothing: a failed read can no longer be mistaken for an empty note
+and overwrite what is still stored in the keyring. While the stored value is
+unknown, the note and the to-do list cannot be edited or changed, so there
+is no way to write over a value the panel never showed; a save that fails
+leaves everything editable, so an oversized note can be shortened and saved
+again. A value that simply does not exist yet — a fresh note, or one that
+was cleared — is not a failure and is saved as usual.
+
+### If the keyring was already broken
+
+An older version of this plugin could leave the keyring file unparseable, in
+which case gnome-keyring drops the whole collection: every entry in it —
+including Chrome's and `gh`'s — becomes unreadable, and the panel cannot
+tell that apart from an empty keyring. Move the damaged file aside to start
+from a clean one, and re-enter the credentials that were in it:
+
+```bash
+mv ~/.local/share/keyrings/Default_keyring.keyring{,.broken}
+```
+
+A stored note or to-do list that cannot be decoded can be discarded from the
+command line:
+
+```bash
+secret-tool clear omarchy-plugin b.omanote field note
+secret-tool clear omarchy-plugin b.omanote field todos
+```
 
 ## Update
 

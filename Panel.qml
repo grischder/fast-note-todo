@@ -21,6 +21,10 @@ Panel {
   property string lookupOutput: ""
   property string lookupError: ""
   property string storageStatus: "idle"
+  property string saveError: ""
+  property string todoSaveError: ""
+  property string loadError: ""
+  property string todoLoadError: ""
   property bool loaded: false
   property bool saveQueued: false
   property bool tempWriteFailed: false
@@ -29,6 +33,9 @@ Panel {
   property bool showCompleted: false
   property int selectedUid: -1
   property var completedItems: []
+  // How many of the oldest completed entries a save in flight is going to
+  // drop, applied to the list on screen only once the save succeeded.
+  property int pendingTrimCount: 0
   property string newTodoText: ""
   property string savedTodoJson: "{}"
   property string savingTodoJson: ""
@@ -76,6 +83,19 @@ Panel {
   readonly property int maxPayloadBytes: 6132
 
   readonly property bool dirty: noteText !== savedText
+  // Whatever went wrong with the last read or save, shown in the panel so a
+  // failure is never invisible (a failed read that used to be treated as an
+  // empty note, or a note that was silently truncated by secret-tool, for
+  // instance). Errors from both tabs are listed: a failed note save must
+  // not disappear just because the to-do tab is open.
+  readonly property string errorMessage: {
+    var parts = []
+    if (loadError) parts.push(loadError)
+    if (saveError) parts.push(saveError)
+    if (todoLoadError) parts.push(todoLoadError)
+    if (todoSaveError) parts.push(todoSaveError)
+    return parts.join(" · ")
+  }
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
   readonly property color foreground: Color.popups.text
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -102,7 +122,10 @@ Panel {
     var listHeight = root.showCompleted ? completedColumn.implicitHeight : todoColumn.implicitHeight
     var todoHeight = todoChrome + Math.min(listHeight, todoListCap)
     var noteHeight = Math.max(noteContentHeight, noteArea.implicitHeight + Style.space(20))
-    return Math.max(noteHeight, todoHeight)
+    // The error banner sits above the content, so it needs room of its own
+    // (its height plus the gap the content area keeps below it).
+    var errorHeight = storageErrorText.visible ? storageErrorText.implicitHeight + Style.space(8) + Style.space(12) : 0
+    return Math.max(noteHeight, todoHeight) + errorHeight
   }
 
   ListModel {
@@ -119,44 +142,91 @@ Panel {
   }
 
   function currentTodoJson() {
-    return JSON.stringify({ mode: viewMode, items: todoModelSnapshot(), completed: completedItems })
+    return todoJsonFor(completedItems)
+  }
+
+  function todoJsonFor(completed) {
+    return JSON.stringify({ mode: viewMode, items: todoModelSnapshot(), completed: completed })
   }
 
   function isTodoDirty() {
     return currentTodoJson() !== savedTodoJson
   }
 
+  // Byte length of a string once it is encoded as UTF-8, which is what the
+  // size limit is measured in.
+  function utf8Length(text) {
+    var s = String(text || "")
+    try {
+      return unescape(encodeURIComponent(s)).length
+    } catch (e) {
+      // A lone surrogate makes encodeURIComponent throw. Counting it as
+      // three bytes is close enough for a size limit.
+      var length = 0
+      for (var i = 0; i < s.length; i++) {
+        var code = s.charCodeAt(i)
+        if (code < 0x80) length += 1
+        else if (code < 0x800) length += 2
+        else length += 3
+      }
+      return length
+    }
+  }
+
   // The keyring attribute stays "b.omanote" (the plugin's pre-fork id) on
   // purpose, independent of moduleName/ipcTarget above — changing it would
   // orphan whatever note is already stored under that key.
   function loadScript(field) {
-    // A payload with a line break in it is stored base64-encoded and
-    // tagged with a marker, so it is a single line in the keyring file
-    // (see storeScript). The value is read into a file first so it can be
-    // decoded byte-exactly, trailing newlines included.
+    // See storeScript for why the payload is base64-encoded and tagged.
     //
     // head -c bounds how much of secret-tool's stdout we ever buffer/parse;
     // PIPESTATUS keeps the script's own exit code equal to secret-tool's
     // (not head's), so a real lookup failure still reports as an error
-    // instead of looking like a successful empty read.
+    // instead of looking like a successful empty read. The value is decoded
+    // through a temp file so the content stays byte-exact, trailing
+    // newlines included, and a value without the marker is read back
+    // unchanged.
+    //
+    // secret-tool exits 1 when the value does not exist and says nothing in
+    // that case; a run that produced an error message is a real failure.
+    // Any other exit status (a signal, for instance) is a failure too, and
+    // a successful run that produced no value at all is not something this
+    // plugin ever stores, so it is treated as a failure as well.
     return "command -v secret-tool >/dev/null 2>&1 || { echo 'secret-tool not found' >&2; exit 127; }\n"
+      + "if [ -z \"${XDG_RUNTIME_DIR:-}\" ]; then echo 'no runtime directory for the temporary file' >&2; exit 1; fi\n"
       + "umask 077\n"
-      + "tmp=$(mktemp -p \"${XDG_RUNTIME_DIR:-/tmp}\" omanote-load.XXXXXX) || exit 1\n"
+      + "tmp=$(mktemp -p \"$XDG_RUNTIME_DIR\" omanote-load.XXXXXX) || exit 1\n"
+      + "err=$(mktemp -p \"$XDG_RUNTIME_DIR\" omanote-load-err.XXXXXX) || { rm -f -- \"$tmp\"; exit 1; }\n"
       + "secret-tool lookup omarchy-plugin b.omanote field " + field
-      + " | head -c " + root.secretReadCapBytes + " > \"$tmp\"\n"
+      + " 2> \"$err\" | head -c " + root.secretReadCapBytes + " > \"$tmp\"\n"
       + "status=${PIPESTATUS[0]}\n"
+      + "if [ \"$status\" -ne 0 ]; then\n"
+      + "  if [ \"$status\" -eq 1 ] && [ ! -s \"$err\" ]; then\n"
+      + "    rm -f -- \"$tmp\" \"$err\"\n"
+      + "    exit 0\n"
+      + "  fi\n"
+      + "  if [ -s \"$err\" ]; then cat -- \"$err\" >&2; fi\n"
+      + "  rm -f -- \"$tmp\" \"$err\"\n"
+      + "  exit \"$status\"\n"
+      + "fi\n"
+      + "if [ ! -s \"$tmp\" ]; then\n"
+      + "  echo 'the stored value could not be read' >&2\n"
+      + "  rm -f -- \"$tmp\" \"$err\"\n"
+      + "  exit 1\n"
+      + "fi\n"
+      + "rm -f -- \"$err\"\n"
       + "if head -c 12 -- \"$tmp\" | cmp -s - <(printf %s omanote-b64:); then\n"
       + "  if ! tail -c +13 -- \"$tmp\" | base64 -d > \"$tmp.out\" 2>/dev/null; then\n"
       + "    echo 'could not decode the stored note' >&2\n"
       + "    rm -f -- \"$tmp\" \"$tmp.out\"\n"
       + "    exit 1\n"
       + "  fi\n"
-      + "  cat -- \"$tmp.out\"\n"
+      + "  if ! cat -- \"$tmp.out\"; then rm -f -- \"$tmp\" \"$tmp.out\"; exit 1; fi\n"
       + "else\n"
-      + "  cat -- \"$tmp\"\n"
+      + "  if ! cat -- \"$tmp\"; then rm -f -- \"$tmp\"; exit 1; fi\n"
       + "fi\n"
       + "rm -f -- \"$tmp\" \"$tmp.out\"\n"
-      + "exit \"$status\""
+      + "exit 0"
   }
 
   function storeScript(field) {
@@ -169,16 +239,17 @@ Panel {
     // the Secret Service asks the user to choose a password for a new
     // keyring.
     //
-    // A payload without a line break cannot break the file, so it is
-    // stored as it is and keeps the full size it had before. Anything with
-    // a line break is base64-encoded and tagged with a marker, which keeps
-    // it on a single line. The marker also tells an encoded value apart
-    // from one written by an earlier version, which is read back unchanged.
+    // A payload without any line break cannot break the file, so it is
+    // stored as it is and keeps the full capacity. Anything with a line
+    // break is base64-encoded and tagged with a marker, which keeps it on
+    // a single line. The marker also tells an encoded value apart from
+    // one written by an earlier version, which is read back unchanged.
     //
     // secret-tool reads at most 8192 bytes from stdin and truncates
     // anything beyond that *without failing*, so the size is checked up
     // front: an oversized payload is refused instead of silently losing
-    // its tail. See maxRawBytes and maxPayloadBytes for the arithmetic.
+    // its tail. See maxPayloadBytes for the arithmetic of the encoded
+    // path.
     return "path=$1\n"
       + "if ! command -v secret-tool >/dev/null 2>&1; then\n"
       + "  echo 'secret-tool not found' >&2\n"
@@ -211,8 +282,28 @@ Panel {
   }
 
   function clearScript(field) {
+    // secret-tool exits 1 when there is nothing to clear, and says nothing
+    // when it does. Clearing an already empty note is not a failure worth
+    // showing, so a silent exit 1 counts as success. Any other exit status
+    // is a failure, even without a message: a clear that did not happen
+    // must not be reported as one that did.
     return "command -v secret-tool >/dev/null 2>&1 || { echo 'secret-tool not found' >&2; exit 127; }\n"
-      + "secret-tool clear omarchy-plugin b.omanote field " + field
+      + "if [ -z \"${XDG_RUNTIME_DIR:-}\" ]; then echo 'no runtime directory for the temporary file' >&2; exit 1; fi\n"
+      + "umask 077\n"
+      + "err=$(mktemp -p \"$XDG_RUNTIME_DIR\" omanote-clear-err.XXXXXX) || exit 1\n"
+      + "secret-tool clear omarchy-plugin b.omanote field " + field + " 2> \"$err\"\n"
+      + "status=$?\n"
+      + "if [ \"$status\" -ne 0 ]; then\n"
+      + "  if [ \"$status\" -eq 1 ] && [ ! -s \"$err\" ]; then\n"
+      + "    rm -f -- \"$err\"\n"
+      + "    exit 0\n"
+      + "  fi\n"
+      + "  if [ -s \"$err\" ]; then cat -- \"$err\" >&2; fi\n"
+      + "  rm -f -- \"$err\"\n"
+      + "  exit \"$status\"\n"
+      + "fi\n"
+      + "rm -f -- \"$err\"\n"
+      + "exit 0"
   }
 
   function tempPath() {
@@ -265,6 +356,10 @@ Panel {
 
   function updateText(value) {
     noteText = String(value || "")
+    // A note that was never loaded successfully must not be written back:
+    // the keystrokes are shown, but nothing is saved (saveNow() bails out
+    // while `loaded` is false), so a failed read can never overwrite or
+    // clear the value that is still in the keyring.
     if (!loaded || storageStatus === "loading") return
     saveTimer.restart()
   }
@@ -279,16 +374,21 @@ Panel {
 
   function applyLoadedText(exitCode) {
     var error = String(lookupError || "").trim()
-    if (exitCode === 0 || error === "") {
-      var text = exitCode === 0 ? String(lookupOutput || "") : ""
+    if (exitCode === 0) {
+      var text = String(lookupOutput || "")
       noteText = text
       savedText = text
       loaded = true
+      loadError = ""
       storageStatus = "ready"
       return
     }
 
-    loaded = true
+    // The lookup failed, so we do not know what is stored. `loaded` stays
+    // false, which disables the editor and stops every save: nothing can
+    // overwrite or clear the stored note, and the next open retries.
+    loaded = false
+    loadError = error || "could not read the note from the keyring"
     storageStatus = "error"
   }
 
@@ -303,6 +403,10 @@ Panel {
 
     savingText = noteText
     storageStatus = "saving"
+    // Cleared here rather than in finishSave(): the message belongs to the
+    // attempt that produced it, so a failure from an earlier save cannot
+    // survive into a later, successful one.
+    saveError = ""
 
     if (savingText === "") {
       clearProc.command = ["bash", "-c", clearScript("note"), "omanote-clear"]
@@ -312,16 +416,20 @@ Panel {
 
     var path = tempPath()
     if (path === "") {
+      saveError = "no runtime directory for the temporary note file"
       storageStatus = "error"
       return
     }
 
     // Secret-tool needs EOF for multiline stdin. The transient source file
     // lives only in the user's runtime tmpfs and is deleted by storeScript().
+    // It is written by Quickshell, so its mode is not ours to set; the
+    // 0700 runtime directory is what keeps it out of reach.
     savePath = path
     tempWriteFailed = false
     saveFile.setText(savingText)
     if (tempWriteFailed) {
+      saveError = "could not write the temporary note file"
       storageStatus = "error"
       return
     }
@@ -337,6 +445,8 @@ Panel {
       savedText = savingText
       storageStatus = noteText === savedText ? "ready" : "saving"
     } else {
+      // A failure that produced no message still has to be visible.
+      if (saveError === "") saveError = "could not save the note (secret-tool exited with " + exitCode + ")"
       storageStatus = "error"
     }
 
@@ -349,6 +459,9 @@ Panel {
   }
 
   function addTodoItem() {
+    // Nothing may change the list while the stored value is unknown: the
+    // change would look saved in the panel but never reach the keyring.
+    if (!todoLoaded) return
     var text = String(newTodoText || "").trim()
     if (text === "") return
     var uid = root.nextTodoUid++
@@ -361,6 +474,7 @@ Panel {
   }
 
   function setTodoDone(index, done) {
+    if (!todoLoaded) return
     if (index < 0 || index >= todoModel.count) return
     var uid = todoModel.get(index).uid
     var wasSelected = done && root.selectedUid === uid
@@ -375,6 +489,7 @@ Panel {
   }
 
   function deleteTodoAt(index) {
+    if (!todoLoaded) return
     if (index < 0 || index >= todoModel.count) return
     var uid = todoModel.get(index).uid
     if (root.editingUid === uid) root.editingUid = -1
@@ -424,6 +539,7 @@ Panel {
   }
 
   function setTodoText(index, text) {
+    if (!todoLoaded) return
     if (index < 0 || index >= todoModel.count) return
     var trimmed = String(text || "").trim()
     if (trimmed === "") return
@@ -443,6 +559,7 @@ Panel {
   }
 
   function moveTodoItem(index, target) {
+    if (!todoLoaded) return
     if (index < 0 || index >= todoModel.count) return
     if (target < 0 || target >= todoModel.count) return
     if (index === target) return
@@ -463,6 +580,7 @@ Panel {
   }
 
   function removeTodoAt(index) {
+    if (!todoLoaded) return
     if (index < 0 || index >= todoModel.count) return
     var removedText = todoModel.get(index).text
     todoModel.remove(index)
@@ -473,6 +591,7 @@ Panel {
   }
 
   function restoreCompletedItem(index) {
+    if (!todoLoaded) return
     if (index < 0 || index >= completedItems.length) return
     var completed = completedItems.slice()
     var entry = completed.splice(index, 1)[0]
@@ -496,11 +615,12 @@ Panel {
 
   function applyLoadedTodos(exitCode) {
     var error = String(todoLookupError || "").trim()
-    if (exitCode === 0 || error === "") {
-      var raw = exitCode === 0 ? String(todoLookupOutput || "") : ""
+    if (exitCode === 0) {
+      var raw = String(todoLookupOutput || "")
       var parsedItems = []
       var parsedCompleted = []
       var parsedMode = root.viewMode
+      var unreadable = false
       if (raw !== "") {
         try {
           var data = JSON.parse(raw)
@@ -513,6 +633,11 @@ Panel {
               parsedItems = data.items
                 .filter(function(item) { return item && typeof item.text === "string" })
                 .map(function(item) { return { text: item.text, done: item.done === true } })
+            } else {
+              // An object without a list of items is not something this
+              // plugin wrote, so it is left alone rather than replaced by
+              // an empty list on the next edit.
+              unreadable = true
             }
             if (Array.isArray(data.completed)) {
               // Older saves stored plain strings with no timestamp — treat
@@ -530,16 +655,30 @@ Panel {
             if (data.mode === "note" || data.mode === "todo") {
               parsedMode = data.mode
             }
+          } else {
+            // Neither a list nor an object: the stored value is not a
+            // to-do list, so it is treated as unreadable rather than as an
+            // empty list (which would overwrite it on the next edit).
+            unreadable = true
           }
         } catch (e) {
-          parsedItems = []
-          parsedCompleted = []
+          unreadable = true
         }
       }
       var cutoff = Date.now() - root.completedRetentionMs
       var beforePruneCount = parsedCompleted.length
       parsedCompleted = parsedCompleted.filter(function(entry) { return entry.completedAt >= cutoff })
       var prunedOnLoad = parsedCompleted.length !== beforePruneCount
+
+      if (unreadable) {
+        // The stored value is not a to-do list. Leave it alone rather than
+        // overwriting it with an empty list on the next edit.
+        todoLoaded = false
+        todoLoadError = "the stored to-do list is unreadable"
+        todoStorageStatus = "error"
+        return
+      }
+
       todoModel.clear()
       for (var i = 0; i < parsedItems.length; i++) {
         todoModel.append({ uid: root.nextTodoUid++, text: parsedItems[i].text, done: parsedItems[i].done === true })
@@ -547,6 +686,7 @@ Panel {
       completedItems = parsedCompleted
       root.viewMode = parsedMode
       todoLoaded = true
+      todoLoadError = ""
       todoStorageStatus = "ready"
       root.ensureTodoSelection()
       if (prunedOnLoad) {
@@ -560,7 +700,11 @@ Panel {
       return
     }
 
-    todoLoaded = true
+    // The lookup failed, so we do not know what is stored. `todoLoaded`
+    // stays false: no save can run (and therefore the stored list can
+    // neither be overwritten nor cleared), and the next open retries.
+    todoLoaded = false
+    todoLoadError = error || "could not read the to-do list from the keyring"
     todoStorageStatus = "error"
   }
 
@@ -573,7 +717,30 @@ Panel {
       return
     }
 
-    savingTodoJson = currentTodoJson()
+    // The payload has to fit into what secret-tool can store. The to-do
+    // list is always single-line (JSON.stringify escapes the control
+    // characters), so it is stored as it is and the limit is the one for
+    // an unencoded payload. The oldest completed entries are dropped
+    // first: they are a history buffer that is pruned anyway, and losing
+    // them is better than losing the whole list. Only the *number* of
+    // entries to drop is remembered, so a change made while the save is
+    // in flight is not thrown away with them.
+    todoSaveError = ""
+
+    var trimmed = root.completedItems
+    var json = todoJsonFor(trimmed)
+    while (utf8Length(json) > root.maxRawBytes && trimmed.length > 0) {
+      trimmed = trimmed.slice(0, trimmed.length - 1)
+      json = todoJsonFor(trimmed)
+    }
+    if (utf8Length(json) > root.maxRawBytes) {
+      todoSaveError = "the to-do list is too large for the keyring (max " + root.maxRawBytes + " bytes of text)"
+      todoStorageStatus = "error"
+      return
+    }
+    pendingTrimCount = root.completedItems.length - trimmed.length
+
+    savingTodoJson = json
     todoStorageStatus = "saving"
 
     if (todoModel.count === 0 && completedItems.length === 0) {
@@ -584,6 +751,8 @@ Panel {
 
     var path = tempPath()
     if (path === "") {
+      pendingTrimCount = 0
+      todoSaveError = "no runtime directory for the temporary to-do file"
       todoStorageStatus = "error"
       return
     }
@@ -592,6 +761,8 @@ Panel {
     todoTempWriteFailed = false
     todoSaveFile.setText(savingTodoJson)
     if (todoTempWriteFailed) {
+      pendingTrimCount = 0
+      todoSaveError = "could not write the temporary to-do file"
       todoStorageStatus = "error"
       return
     }
@@ -604,9 +775,18 @@ Panel {
     todoSavePath = ""
 
     if (exitCode === 0) {
+      // The trimmed history is applied only now, so a failed save does not
+      // drop entries from the list on screen. Only the number of entries is
+      // applied, so a change made while the save was in flight survives.
+      if (pendingTrimCount > 0) {
+        completedItems = completedItems.slice(0, Math.max(0, completedItems.length - pendingTrimCount))
+      }
+      pendingTrimCount = 0
       savedTodoJson = savingTodoJson
       todoStorageStatus = currentTodoJson() === savedTodoJson ? "ready" : "saving"
     } else {
+      // A failure that produced no message still has to be visible.
+      if (todoSaveError === "") todoSaveError = "could not save the to-do list (secret-tool exited with " + exitCode + ")"
       todoStorageStatus = "error"
     }
 
@@ -710,14 +890,20 @@ Panel {
   Process {
     id: storeProc
     stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.saveError = text.trim()
+    }
     onExited: function(exitCode) { root.finishSave(exitCode) }
   }
 
   Process {
     id: clearProc
     stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.saveError = text.trim()
+    }
     onExited: function(exitCode) { root.finishSave(exitCode) }
   }
 
@@ -737,14 +923,20 @@ Panel {
   Process {
     id: todoStoreProc
     stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.todoSaveError = text.trim()
+    }
     onExited: function(exitCode) { root.finishTodoSave(exitCode) }
   }
 
   Process {
     id: todoClearProc
     stdout: StdioCollector { waitForEnd: true }
-    stderr: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.todoSaveError = text.trim()
+    }
     onExited: function(exitCode) { root.finishTodoSave(exitCode) }
   }
 
@@ -891,9 +1083,23 @@ Panel {
         foreground: root.foreground
       }
 
+      Text {
+        id: storageErrorText
+        anchors.top: headerSeparator.bottom
+        anchors.topMargin: Style.space(8)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        visible: root.errorMessage !== ""
+        text: root.errorMessage
+        color: root.bar ? root.bar.urgent : Color.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.Wrap
+      }
+
       Item {
         id: contentArea
-        anchors.top: headerSeparator.bottom
+        anchors.top: storageErrorText.visible ? storageErrorText.bottom : headerSeparator.bottom
         anchors.topMargin: Style.space(12)
         anchors.left: parent.left
         anchors.right: parent.right
@@ -937,7 +1143,13 @@ Panel {
             topPadding: 0
             bottomPadding: 0
             background: null
-            enabled: root.storageStatus !== "loading"
+            // Editing is only possible once the stored note is known: a
+            // failed read must not be turned into a write that overwrites
+            // or clears whatever is in the keyring. Note that this is the
+            // read state, not the save state: a save in progress or a
+            // failed save must not lock the editor, or an oversized note
+            // could not be shortened to make it fit again.
+            enabled: root.loaded
             onTextChanged: if (text !== root.noteText) root.updateText(text)
           }
         }
@@ -961,7 +1173,8 @@ Panel {
               placeholderText: "New item…"
               text: root.newTodoText
               foreground: root.foreground
-              enabled: root.todoStorageStatus !== "loading"
+              // Same as the note: no editing while the stored list is unknown.
+              enabled: root.todoLoaded
               onTextChanged: if (text !== root.newTodoText) root.newTodoText = text
               onAccepted: root.addTodoItem()
               onActiveFocusChanged: if (activeFocus) root.closeEditIfAny()
