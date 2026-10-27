@@ -168,14 +168,15 @@ echo "== 6. a zero-byte stored value is a read failure =="
 do_store "$FIELD" empty.txt
 check "zero-byte payload accepted by the store" 0 $?
 do_load "$FIELD" > loaded_empty.txt 2> empty_err.txt
+empty_rc=$?
 if grep -q "could not be read" load_"$FIELD".sh; then
   # error-handling branch: a zero-byte stored value is a failure
-  check "a zero-byte stored value exits non-zero" 1 $?
+  check "a zero-byte stored value exits non-zero" 1 "$empty_rc"
   check "a zero-byte stored value is explained" "yes" \
     "$(grep -q 'could not be read' empty_err.txt && echo yes || echo no)"
 else
   # core branch: upstream semantics, an empty read is not an error
-  check "a zero-byte stored value exits zero (upstream semantics)" 0 $?
+  check "a zero-byte stored value exits zero (upstream semantics)" 0 "$empty_rc"
 fi
 check "a zero-byte stored value prints no note" "" "$(cat loaded_empty.txt)"
 
