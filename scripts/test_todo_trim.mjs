@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Regression test for the completed-history trimming, mirroring the logic in
 // Panel.qml's saveTodosNow() / finishTodoSave().
 //

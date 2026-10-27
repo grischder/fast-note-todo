@@ -4,6 +4,10 @@
 # to be visible. Run from the branch's checkout:
 #
 #   PLUGIN_DIR=/path/to/checkout scripts/test_error_handling.sh
+#
+# Uses a secret-tool *shim* for the failure cases, so no keyring prompt can
+# appear. The "missing entry" checks need the real tool and a running
+# keyring; they are skipped where there is none.
 set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -16,6 +20,12 @@ cd "$WORK" || exit 1
 FIELD=probecompat
 pass=0
 fail=0
+skip=0
+
+skip() {
+  printf 'SKIP  %-46s %s\n' "$1" "$2"
+  skip=$((skip + 1))
+}
 
 check() {
   if [[ "$2" == "$3" ]]; then
@@ -31,6 +41,19 @@ extract() { python3 "$SCRIPT_DIR/extract_script.py" "$@"; }
 mkload() { extract loadScript "$1" > "load_$1.sh"; }
 do_load()  { bash -c "$(cat "load_$1.sh")" omanote-load; }
 clearfield() { secret-tool clear omarchy-plugin b.omanote field "$1" >/dev/null 2>&1; }
+
+# A missing value can only be told apart from an empty one against a real
+# keyring. Probe for one, and skip the checks that need it otherwise.
+keyring_available() {
+  command -v secret-tool >/dev/null 2>&1 || return 1
+  printf 'probe' | secret-tool store --label=probe omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1 || return 1
+  if ! secret-tool lookup omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1; then
+    secret-tool clear omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1
+    return 1
+  fi
+  secret-tool clear omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1
+  return 0
+}
 
 mkdir -p shim
 cat > shim/secret-tool <<'EOF'
@@ -79,21 +102,24 @@ check "silent empty success is explained" "yes" \
 
 echo
 echo "== a missing value is empty, and clearing it is not an error =="
-cat > shim/secret-tool <<'EOF'
-#!/bin/sh
-exit 1
-EOF
-chmod +x shim/secret-tool
-clearfield nosuchthing
-mkload nosuchthing
-do_load nosuchthing > missing.txt 2> missing_err.txt
-check "missing entry exits zero" 0 $?
-check "missing entry prints nothing" "" "$(cat missing.txt)"
-check "missing entry has no error output" "" "$(cat missing_err.txt)"
 extract clearScript nosuchthing > clear_nosuchthing.sh
-bash -c "$(cat clear_nosuchthing.sh)" omanote-clear > clear_out.txt 2> clear_err.txt
-check "clearing a missing entry exits zero" 0 $?
-check "clearing a missing entry has no error output" "" "$(cat clear_err.txt)"
+if keyring_available; then
+  clearfield nosuchthing
+  mkload nosuchthing
+  do_load nosuchthing > missing.txt 2> missing_err.txt
+  check "missing entry exits zero" 0 $?
+  check "missing entry prints nothing" "" "$(cat missing.txt)"
+  check "missing entry has no error output" "" "$(cat missing_err.txt)"
+  bash -c "$(cat clear_nosuchthing.sh)" omanote-clear > clear_out.txt 2> clear_err.txt
+  check "clearing a missing entry exits zero" 0 $?
+  check "clearing a missing entry has no error output" "" "$(cat clear_err.txt)"
+else
+  for name in "missing entry exits zero" "missing entry prints nothing" \
+              "missing entry has no error output" "clearing a missing entry exits zero" \
+              "clearing a missing entry has no error output"; do
+    skip "$name" "no usable keyring"
+  done
+fi
 
 echo
 echo "== a signal-killed clear is a failure =="
@@ -107,5 +133,5 @@ PATH="$WORK/shim:$PATH" bash -c "$(cat clear_nosuchthing.sh)" omanote-clear \
 check "signal-killed clear exits non-zero" 143 $?
 
 echo
-echo "passed=$pass failed=$fail"
+echo "passed=$pass failed=$fail skipped=$skip"
 [[ $fail -eq 0 ]]
