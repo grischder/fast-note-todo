@@ -33,9 +33,11 @@ Panel {
   property bool showCompleted: false
   property int selectedUid: -1
   property var completedItems: []
-  // How many of the oldest completed entries a save in flight is going to
-  // drop, applied to the list on screen only once the save succeeded.
-  property int pendingTrimCount: 0
+  // The completed entries a save in flight is going to drop, applied to the
+  // list on screen only once the save succeeded. These are remembered by
+  // value, not by count, so restoring one of them while the save is in
+  // flight cannot make a different entry disappear in its place.
+  property var pendingTrimEntries: null
   property string newTodoText: ""
   property string savedTodoJson: "{}"
   property string savingTodoJson: ""
@@ -722,9 +724,9 @@ Panel {
     // characters), so it is stored as it is and the limit is the one for
     // an unencoded payload. The oldest completed entries are dropped
     // first: they are a history buffer that is pruned anyway, and losing
-    // them is better than losing the whole list. Only the *number* of
-    // entries to drop is remembered, so a change made while the save is
-    // in flight is not thrown away with them.
+    // them is better than losing the whole list. Only the entries selected
+    // for trimming are remembered, so a change made while the save is in
+    // flight is not thrown away with them.
     todoSaveError = ""
 
     var trimmed = root.completedItems
@@ -738,7 +740,7 @@ Panel {
       todoStorageStatus = "error"
       return
     }
-    pendingTrimCount = root.completedItems.length - trimmed.length
+    pendingTrimEntries = root.completedItems.slice(trimmed.length)
 
     savingTodoJson = json
     todoStorageStatus = "saving"
@@ -751,7 +753,7 @@ Panel {
 
     var path = tempPath()
     if (path === "") {
-      pendingTrimCount = 0
+      pendingTrimEntries = null
       todoSaveError = "no runtime directory for the temporary to-do file"
       todoStorageStatus = "error"
       return
@@ -761,7 +763,7 @@ Panel {
     todoTempWriteFailed = false
     todoSaveFile.setText(savingTodoJson)
     if (todoTempWriteFailed) {
-      pendingTrimCount = 0
+      pendingTrimEntries = null
       todoSaveError = "could not write the temporary to-do file"
       todoStorageStatus = "error"
       return
@@ -776,12 +778,19 @@ Panel {
 
     if (exitCode === 0) {
       // The trimmed history is applied only now, so a failed save does not
-      // drop entries from the list on screen. Only the number of entries is
-      // applied, so a change made while the save was in flight survives.
-      if (pendingTrimCount > 0) {
-        completedItems = completedItems.slice(0, Math.max(0, completedItems.length - pendingTrimCount))
+      // drop entries from the list on screen. Only the entries selected for
+      // trimming are dropped, and only if they are still there: an entry
+      // the user restored while the save was in flight is left alone.
+      if (pendingTrimEntries !== null) {
+        var dropped = pendingTrimEntries
+        completedItems = completedItems.filter(function(entry) {
+          for (var i = 0; i < dropped.length; i++) {
+            if (dropped[i].text === entry.text && dropped[i].completedAt === entry.completedAt) return false
+          }
+          return true
+        })
       }
-      pendingTrimCount = 0
+      pendingTrimEntries = null
       savedTodoJson = savingTodoJson
       todoStorageStatus = currentTodoJson() === savedTodoJson ? "ready" : "saving"
     } else {
