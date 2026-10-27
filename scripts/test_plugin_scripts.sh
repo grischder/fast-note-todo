@@ -20,6 +20,12 @@ STARTED=$(date '+%Y-%m-%d %H:%M:%S')
 FIELD=probecompat
 pass=0
 fail=0
+skip=0
+
+skip() {
+  printf 'SKIP  %-46s %s\n' "$1" "$2"
+  skip=$((skip + 1))
+}
 
 check() {
   if [[ "$2" == "$3" ]]; then
@@ -67,6 +73,21 @@ if ! grep -q omanote-b64 "store_$FIELD.sh"; then
   exit 2
 fi
 
+# The checks below store probe entries in the running keyring and read them
+# back. Where that is not possible (CI, a container, another secret service)
+# say so and leave, instead of reporting the missing keyring as a bug.
+if ! command -v secret-tool >/dev/null 2>&1; then
+  echo "SKIPPED: secret-tool is not installed"
+  exit 0
+fi
+printf 'probe' | secret-tool store --label=probe omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1
+if ! secret-tool lookup omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1; then
+  secret-tool clear omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1
+  echo "SKIPPED: no usable keyring (secret-tool cannot store and read a value)"
+  exit 0
+fi
+secret-tool clear omarchy-plugin b.omanote field omanote-probe >/dev/null 2>&1
+
 clearfield "$FIELD"
 mkload "$FIELD"; mkstore "$FIELD"
 
@@ -81,8 +102,12 @@ check "stored value has no newline" 0 \
   "$(secret-tool lookup omarchy-plugin b.omanote field "$FIELD" | wc -l)"
 do_load "$FIELD" > loaded.txt
 check "loaded text is byte-exact" "$(cat note.orig.txt)" "$(cat loaded.txt)"
-keyring_valid
-check "keyring file has no malformed lines" 0 $?
+if [[ -f $KEYRING ]]; then
+  keyring_valid
+  check "keyring file has no malformed lines" 0 $?
+else
+  skip "keyring file has no malformed lines" "no keyring file at $KEYRING"
+fi
 
 echo
 echo "== 1b. a single-line payload is stored verbatim and keeps its size =="
@@ -198,10 +223,14 @@ check "failing lookup prints no note" "" "$(cat failed_load.txt)"
 echo
 echo "== 9. daemon saw no format errors =="
 since="$STARTED"
-check "no 'invalid or unrecognized format' logged" 0 \
-  "$(journalctl --user -u gnome-keyring-daemon.service --since "$since" --no-pager | grep -c 'invalid or unrecognized format')"
+if journalctl --user -u gnome-keyring-daemon.service --since "$since" --no-pager >/dev/null 2>&1; then
+  check "no 'invalid or unrecognized format' logged" 0 \
+    "$(journalctl --user -u gnome-keyring-daemon.service --since "$since" --no-pager | grep -c 'invalid or unrecognized format')"
+else
+  skip "no 'invalid or unrecognized format' logged" "no journal for gnome-keyring-daemon.service"
+fi
 
 clearfield "$FIELD"
 echo
-echo "passed=$pass failed=$fail"
+echo "passed=$pass failed=$fail skipped=$skip"
 [[ $fail -eq 0 ]]
